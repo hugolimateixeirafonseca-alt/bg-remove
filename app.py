@@ -1,6 +1,6 @@
 
 """
-padel-alpha-clean  (v10 - improved chroma remove + clean)
+padel-alpha-clean  (v11 - improved chroma remove + clean, green chroma ready)
 ----------------------------------------------------------
 Endpoints:
 GET  /                -> health
@@ -141,7 +141,7 @@ def _trim_transparent_border(img):
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 10})
+    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 11})
 
 
 @app.route("/key-bg-remove", methods=["POST"])
@@ -150,9 +150,9 @@ def key_bg_remove():
     url = data.get("url")
     imgbb_key = data.get("imgbb_key")
     color_hex = data.get("color_hex")
-    tolerance = int(float(data.get("tolerance", 58)))
-    soft_tolerance = int(float(data.get("soft_tolerance", max(tolerance + 60, 118))))
-    feather = float(data.get("feather", 0.35))
+    tolerance = int(float(data.get("tolerance", 56)))
+    soft_tolerance = int(float(data.get("soft_tolerance", max(tolerance + 52, 108))))
+    feather = float(data.get("feather", 0.25))
     decontaminate = bool(data.get("decontaminate", True))
     auto_crop_border = bool(data.get("auto_crop_border", False))
 
