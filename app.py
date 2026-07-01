@@ -1,18 +1,22 @@
+
 """
-padel-alpha-clean  (v9 - chroma remove + clean)
-------------------------------------------------
+padel-alpha-clean  (v10 - improved chroma remove + clean)
+----------------------------------------------------------
 Endpoints:
 GET  /                -> health
 POST /clean           -> existing alpha-aware clean/upscale pipeline
-POST /key-bg-remove   -> remove a solid chroma background (ex: #FF00FF or #00FF00)
+POST /key-bg-remove   -> remove a solid chroma background with soft edge alpha
+                         and chroma decontamination to reduce pink/green halos.
 
 /key-bg-remove body:
 {
   "url": "https://...",           # required, source image URL (opaque)
   "imgbb_key": "...",             # required
   "color_hex": "#FF00FF",         # optional, explicit chroma colour
-  "tolerance": 60,                 # optional, RGB-distance threshold (default 60)
-  "feather": 1.2,                  # optional, blur radius on alpha edge (default 1.2)
+  "tolerance": 58,                 # optional, hard background threshold
+  "soft_tolerance": 118,           # optional, soft fringe threshold
+  "feather": 0.35,                 # optional, subtle alpha blur after extraction
+  "decontaminate": true,           # optional, unmixes chroma from edge pixels
   "auto_crop_border": false        # optional, if true trims uniform transparent border
 }
 Response: {"url": "https://i.ibb.co/...", "detected_bg": "#ff00ff"}
@@ -92,22 +96,19 @@ def _detect_border_colour(arr):
         arr[:, 0, :3],
         arr[:, w - 1, :3],
     ], axis=0)
-    # round colours slightly to resist antialiasing noise
     rounded = (np.round(border / 16) * 16).astype(np.uint8)
     uniq, counts = np.unique(rounded.reshape(-1, 3), axis=0, return_counts=True)
     dominant = uniq[np.argmax(counts)]
     return tuple(int(x) for x in dominant.tolist())
 
 
-def _border_connected_mask(near_bg):
-    """Flood-fill only pixels connected to the border, so internal similar pixels
-    inside the artwork are preserved if not connected to the outer background."""
-    h, w = near_bg.shape
+def _border_connected_mask(mask):
+    h, w = mask.shape
     visited = np.zeros((h, w), dtype=bool)
     q = deque()
 
     def push(y, x):
-        if 0 <= y < h and 0 <= x < w and near_bg[y, x] and not visited[y, x]:
+        if 0 <= y < h and 0 <= x < w and mask[y, x] and not visited[y, x]:
             visited[y, x] = True
             q.append((y, x))
 
@@ -140,7 +141,7 @@ def _trim_transparent_border(img):
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 9})
+    return jsonify({"ok": True, "service": "padel-alpha-clean", "ver": 10})
 
 
 @app.route("/key-bg-remove", methods=["POST"])
@@ -149,12 +150,16 @@ def key_bg_remove():
     url = data.get("url")
     imgbb_key = data.get("imgbb_key")
     color_hex = data.get("color_hex")
-    tolerance = int(float(data.get("tolerance", 60)))
-    feather = float(data.get("feather", 1.2))
+    tolerance = int(float(data.get("tolerance", 58)))
+    soft_tolerance = int(float(data.get("soft_tolerance", max(tolerance + 60, 118))))
+    feather = float(data.get("feather", 0.35))
+    decontaminate = bool(data.get("decontaminate", True))
     auto_crop_border = bool(data.get("auto_crop_border", False))
 
     if not url or not imgbb_key:
         return jsonify({"error": "faltam 'url' e/ou 'imgbb_key'"}), 400
+    if soft_tolerance < tolerance + 1:
+        soft_tolerance = tolerance + 1
 
     try:
         img = _download_image(url)
@@ -167,26 +172,51 @@ def key_bg_remove():
         gc.collect()
 
     arr = np.array(img, dtype=np.uint8)
-    rgb = arr[:, :, :3]
-    alpha_orig = arr[:, :, 3]
+    rgb = arr[:, :, :3].astype(np.float32)
+    alpha_orig = (arr[:, :, 3].astype(np.float32) / 255.0)
 
     try:
         target = _parse_hex_colour(color_hex) if color_hex else _detect_border_colour(arr)
     except Exception as e:
         return jsonify({"error": f"cor de chroma inválida: {e}"}), 400
 
-    target_arr = np.array(target, dtype=np.int16)
-    dist = np.sqrt(np.sum((rgb.astype(np.int16) - target_arr) ** 2, axis=2))
-    near_bg = dist <= tolerance
-    bg_mask = _border_connected_mask(near_bg)
+    bg = np.array(target, dtype=np.float32)
+    dist = np.sqrt(np.sum((rgb - bg) ** 2, axis=2))
 
-    # Start from original alpha; remove border-connected chroma.
-    new_alpha = alpha_orig.copy()
-    new_alpha[bg_mask] = 0
+    hard_candidate = dist <= tolerance
+    soft_candidate = dist <= soft_tolerance
 
-    out = Image.fromarray(np.dstack([rgb, new_alpha]).astype(np.uint8), mode="RGBA")
+    bg_hard = _border_connected_mask(hard_candidate)
+    bg_soft = _border_connected_mask(soft_candidate)
 
-    # Feather only slightly, to soften anti-aliased edge transitions.
+    # Soft alpha ramp for border-connected chroma region.
+    alpha_from_dist = np.ones_like(alpha_orig, dtype=np.float32)
+    alpha_from_dist[bg_hard] = 0.0
+    transition = bg_soft & (~bg_hard)
+    if np.any(transition):
+        alpha_from_dist[transition] = np.clip(
+            (dist[transition] - tolerance) / float(soft_tolerance - tolerance),
+            0.0,
+            1.0,
+        )
+
+    new_alpha = np.minimum(alpha_orig, alpha_from_dist)
+
+    if decontaminate:
+        # Recover foreground colour from pixels that are a chroma/foreground mixture.
+        edge = bg_soft & (new_alpha > 0.001) & (new_alpha < 0.999)
+        if np.any(edge):
+            a = np.clip(new_alpha[edge], 1e-3, 1.0)
+            obs = rgb[edge]
+            fg = (obs - (1.0 - a)[:, None] * bg[None, :]) / a[:, None]
+            rgb[edge] = np.clip(fg, 0.0, 255.0)
+
+    out_rgba = np.dstack([
+        np.clip(rgb, 0, 255).astype(np.uint8),
+        np.clip(new_alpha * 255.0, 0, 255).astype(np.uint8),
+    ])
+    out = Image.fromarray(out_rgba, mode="RGBA")
+
     if feather > 0:
         a = out.getchannel("A").filter(ImageFilter.GaussianBlur(radius=feather))
         out.putalpha(a)
@@ -243,7 +273,6 @@ def clean():
 
     if threshold > 0 or erode_px > 0 or keyline_px > 0:
         import cv2
-
         arr = np.array(img)
         rgb = arr[:, :, :3]
         alpha = arr[:, :, 3]
